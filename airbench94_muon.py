@@ -1,14 +1,3 @@
-"""
-airbench94_muon.py
-Runs in 2.59 seconds on a 400W NVIDIA A100 using torch==2.4.1
-Attains 94.01 mean accuracy (n=200 trials)
-Descends from https://github.com/tysam-code/hlb-CIFAR10/blob/main/main.py
-"""
-
-#############################################
-#                  Setup                    #
-#############################################
-
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -24,21 +13,13 @@ import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
 
-#############################################
-#               Muon optimizer              #
-#############################################
+NUM_CLASSES = 100
+DATA_DIR = "/data/cifar100"
+NUM_TRIALS = int(os.environ.get("NUM_TRIALS", "10"))
 
 @torch.compile
 def zeropower_via_newtonschulz5(G, steps=3, eps=1e-7):
-    """
-    Newton-Schulz iteration to compute the zeroth power / orthogonalization of G. We opt to use a
-    quintic iteration whose coefficients are selected to maximize the slope at zero. For the purpose
-    of minimizing steps, it turns out to be empirically effective to keep increasing the slope at
-    zero even beyond the point where the iteration no longer converges all the way to one everywhere
-    on the interval. This iteration therefore does not produce UV^T but rather something like US'V^T
-    where S' is diagonal with S_{ii}' \sim Uniform(0.5, 1.5), which turns out not to hurt model
-    performance at all relative to UV^T, where USV^T = G is the SVD.
-    """
+    # Quintic Newton-Schulz orthogonalization.
     assert len(G.shape) == 2
     a, b, c = (3.4445, -4.7750,  2.0315)
     X = G.bfloat16()
@@ -84,12 +65,9 @@ class Muon(torch.optim.Optimizer):
                 update = zeropower_via_newtonschulz5(g.reshape(len(g), -1)).view(g.shape) # whiten the update
                 p.data.add_(update, alpha=-lr) # take a step
 
-#############################################
-#                DataLoader                 #
-#############################################
-
-CIFAR_MEAN = torch.tensor((0.4914, 0.4822, 0.4465))
-CIFAR_STD = torch.tensor((0.2470, 0.2435, 0.2616))
+# CIFAR-100 normalization statistics (standard values).
+CIFAR_MEAN = torch.tensor((0.5071, 0.4865, 0.4409))
+CIFAR_STD = torch.tensor((0.2673, 0.2564, 0.2762))
 
 def batch_flip_lr(inputs):
     flip_mask = (torch.rand(len(inputs), device=inputs.device) < 0.5).view(-1, 1, 1, 1)
@@ -99,7 +77,6 @@ def batch_crop(images, crop_size):
     r = (images.size(-1) - crop_size)//2
     shifts = torch.randint(-r, r+1, size=(len(images), 2), device=images.device)
     images_out = torch.empty((len(images), 3, crop_size, crop_size), device=images.device, dtype=images.dtype)
-    # The two cropping methods in this if-else produce equivalent results, but the second is faster for r > 2.
     if r <= 2:
         for sy in range(-r, r+1):
             for sx in range(-r, r+1):
@@ -120,18 +97,17 @@ class CifarLoader:
     def __init__(self, path, train=True, batch_size=500, aug=None):
         data_path = os.path.join(path, "train.pt" if train else "test.pt")
         if not os.path.exists(data_path):
-            dset = torchvision.datasets.CIFAR10(path, download=True, train=train)
+            os.makedirs(path, exist_ok=True)
+            dset = torchvision.datasets.CIFAR100(path, download=True, train=train)
             images = torch.tensor(dset.data)
             labels = torch.tensor(dset.targets)
             torch.save({"images": images, "labels": labels, "classes": dset.classes}, data_path)
 
         data = torch.load(data_path, map_location=torch.device("cuda"))
         self.images, self.labels, self.classes = data["images"], data["labels"], data["classes"]
-        # It's faster to load+process uint8 data than to load preprocessed fp16 data
         self.images = (self.images.half() / 255).permute(0, 3, 1, 2).to(memory_format=torch.channels_last)
-
         self.normalize = T.Normalize(CIFAR_MEAN, CIFAR_STD)
-        self.proc_images = {} # Saved results of image processing to be done on the first epoch
+        self.proc_images = {}
         self.epoch = 0
 
         self.aug = aug or {}
@@ -149,10 +125,8 @@ class CifarLoader:
 
         if self.epoch == 0:
             images = self.proc_images["norm"] = self.normalize(self.images)
-            # Pre-flip images in order to do every-other epoch flipping scheme
             if self.aug.get("flip", False):
                 images = self.proc_images["flip"] = batch_flip_lr(images)
-            # Pre-pad images to save time when doing random translation
             pad = self.aug.get("translate", 0)
             if pad > 0:
                 self.proc_images["pad"] = F.pad(images, (pad,)*4, "reflect")
@@ -163,7 +137,6 @@ class CifarLoader:
             images = self.proc_images["flip"]
         else:
             images = self.proc_images["norm"]
-        # Flip all images together every other epoch. This increases diversity relative to random flipping
         if self.aug.get("flip", False):
             if self.epoch % 2 == 1:
                 images = images.flip(-1)
@@ -175,16 +148,10 @@ class CifarLoader:
             idxs = indices[i*self.batch_size:(i+1)*self.batch_size]
             yield (images[idxs], self.labels[idxs])
 
-#############################################
-#            Network Definition             #
-#############################################
-
-# note the use of low BatchNorm stats momentum
-class BatchNorm(nn.BatchNorm2d):
+class BatchNorm(nn.BatchNorm2d):  # low momentum
     def __init__(self, num_features, momentum=0.6, eps=1e-12):
         super().__init__(num_features, eps=eps, momentum=1-momentum)
         self.weight.requires_grad = False
-        # Note that PyTorch already initializes the weights to one and bias to zero
 
 class Conv(nn.Conv2d):
     def __init__(self, in_channels, out_channels):
@@ -216,7 +183,7 @@ class ConvGroup(nn.Module):
         return x
 
 class CifarNet(nn.Module):
-    def __init__(self):
+    def __init__(self, num_classes=NUM_CLASSES):
         super().__init__()
         widths = dict(block1=64, block2=256, block3=256)
         whiten_kernel_size = 2
@@ -230,7 +197,7 @@ class CifarNet(nn.Module):
             ConvGroup(widths["block2"], widths["block3"]),
             nn.MaxPool2d(3),
         )
-        self.head = nn.Linear(widths["block3"], 10, bias=False)
+        self.head = nn.Linear(widths["block3"], num_classes, bias=False)
         for mod in self.modules():
             if isinstance(mod, BatchNorm):
                 mod.float()
@@ -260,10 +227,6 @@ class CifarNet(nn.Module):
         x = x.view(len(x), -1)
         return self.head(x) / x.size(-1)
 
-############################################
-#                 Logging                  #
-############################################
-
 def print_columns(columns_list, is_head=False, is_final_entry=False):
     print_string = ""
     for col in columns_list:
@@ -290,19 +253,7 @@ def print_training_details(variables, is_final_entry):
         formatted.append(res.rjust(len(col)))
     print_columns(formatted, is_final_entry=is_final_entry)
 
-############################################
-#               Evaluation                 #
-############################################
-
 def infer(model, loader, tta_level=0):
-
-    # Test-time augmentation strategy (for tta_level=2):
-    # 1. Flip/mirror the image left-to-right (50% of the time).
-    # 2. Translate the image by one pixel either up-and-left or down-and-right (50% of the time,
-    #    i.e. both happen 25% of the time).
-    #
-    # This creates 6 views per image (left/right times the two translations and no-translation),
-    # which we evaluate and then weight according to the given probabilities.
 
     def infer_basic(inputs, net):
         return net(inputs).clone()
@@ -333,10 +284,6 @@ def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
     return (logits.argmax(1) == loader.labels).float().mean().item()
 
-############################################
-#                Training                  #
-############################################
-
 def main(run, model):
 
     batch_size = 2000
@@ -344,15 +291,13 @@ def main(run, model):
     head_lr = 0.67
     wd = 2e-6 * batch_size
 
-    test_loader = CifarLoader("cifar10", train=False, batch_size=2000)
-    train_loader = CifarLoader("cifar10", train=True, batch_size=batch_size, aug=dict(flip=True, translate=2))
+    test_loader = CifarLoader(DATA_DIR, train=False, batch_size=2000)
+    train_loader = CifarLoader(DATA_DIR, train=True, batch_size=batch_size, aug=dict(flip=True, translate=2))
     if run == "warmup":
-        # The only purpose of the first run is to warmup the compiled model, so we can use dummy data
-        train_loader.labels = torch.randint(0, 10, size=(len(train_loader.labels),), device=train_loader.labels.device)
-    total_train_steps = ceil(8 * len(train_loader))
+        train_loader.labels = torch.randint(0, NUM_CLASSES, size=(len(train_loader.labels),), device=train_loader.labels.device)
+    total_train_steps = ceil(18 * len(train_loader))
     whiten_bias_train_steps = ceil(3 * len(train_loader))
 
-    # Create optimizers and learning rate schedulers
     filter_params = [p for p in model.parameters() if len(p.shape) == 4 and p.requires_grad]
     norm_biases = [p for n, p in model.named_parameters() if "norm" in n and p.requires_grad]
     param_configs = [dict(params=[model.whiten.bias], lr=bias_lr, weight_decay=wd/bias_lr),
@@ -365,7 +310,6 @@ def main(run, model):
         for group in opt.param_groups:
             group["initial_lr"] = group["lr"]
 
-    # For accurately timing GPU code
     starter = torch.cuda.Event(enable_timing=True)
     ender = torch.cuda.Event(enable_timing=True)
     time_seconds = 0.0
@@ -380,17 +324,12 @@ def main(run, model):
     model.reset()
     step = 0
 
-    # Initialize the whitening layer using training images
     start_timer()
     train_images = train_loader.normalize(train_loader.images[:5000])
     model.init_whiten(train_images)
     stop_timer()
 
     for epoch in range(ceil(total_train_steps / len(train_loader))):
-
-        ####################
-        #     Training     #
-        ####################
 
         start_timer()
         model.train()
@@ -409,19 +348,10 @@ def main(run, model):
                 break
         stop_timer()
 
-        ####################
-        #    Evaluation    #
-        ####################
-
-        # Save the accuracy and loss from the last training batch of the epoch
         train_acc = (outputs.detach().argmax(1) == labels).float().mean().item()
         val_acc = evaluate(model, test_loader, tta_level=0)
         print_training_details(locals(), is_final_entry=False)
         run = None # Only print the run number once
-
-    ####################
-    #  TTA Evaluation  #
-    ####################
 
     start_timer()
     tta_val_acc = evaluate(model, test_loader, tta_level=2)
@@ -429,22 +359,34 @@ def main(run, model):
     epoch = "eval"
     print_training_details(locals(), is_final_entry=True)
 
-    return tta_val_acc
+    return tta_val_acc, time_seconds
 
 if __name__ == "__main__":
 
-    # We re-use the compiled model between runs to save the non-data-dependent compilation time
     model = CifarNet().cuda().to(memory_format=torch.channels_last)
     model.compile(mode="max-autotune")
 
     print_columns(logging_columns_list, is_head=True)
     main("warmup", model)
-    accs = torch.tensor([main(run, model) for run in range(200)])
-    print("Mean: %.4f    Std: %.4f" % (accs.mean(), accs.std()))
+    results = [main(run, model) for run in range(NUM_TRIALS)]
+    accs = torch.tensor([r[0] for r in results])
+    times = torch.tensor([r[1] for r in results])
+    print("acc_mean: %.4f\n" % accs.mean())
+    print("time_mean: %.2f\n" % times.mean())
+    print("acc_std: %.4f\n" % accs.std())
+    print("time_std: %.2f\n" % times.std())
 
     log_dir = os.path.join("logs", str(uuid.uuid4()))
     os.makedirs(log_dir, exist_ok=True)
-    log_path = os.path.join(log_dir, "log.pt")
-    torch.save(dict(code=code, accs=accs), log_path)
+    log_path = os.path.join(log_dir, "log.txt")
+    with open(log_path, "w") as f:
+        f.write("acc_mean: %.4f\n" % accs.mean())
+        f.write("acc_std: %.4f\n" % accs.std())
+        f.write("time_mean: %.2f\n" % times.mean())
+        f.write("time_std: %.2f\n" % times.std())
+        f.write("accs: %s\n" % accs.tolist())
+        f.write("times: %s\n" % times.tolist())
+        f.write("\n--- code ---\n")
+        f.write(code)
     print(os.path.abspath(log_path))
 
